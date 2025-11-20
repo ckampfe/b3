@@ -28,6 +28,10 @@ pub enum Error {
         entry_file_path: PathBuf,
         entry_position: u32,
     },
+    #[error("could not acquire permit to read")]
+    ReadPermit(#[from] tokio::sync::AcquireError),
+    #[error("timeout")]
+    Timeout(#[from] tokio::time::error::Elapsed),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -39,9 +43,20 @@ pub enum SyncStrategy {
     FullSync,
 }
 
-#[derive(Default)]
 pub struct Options {
+    /// how to sync data to the filesystem after writes (inserts and deletes)
     sync_strategy: SyncStrategy,
+    /// the maximum number of concurrent readers
+    max_readers: u32,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            sync_strategy: Default::default(),
+            max_readers: 50,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -84,6 +99,24 @@ where
         self.db_impl.delete(k).await
     }
 
+    /// no writers or readers are allowed
+    pub async fn merge(&self, timeout: std::time::Duration) -> Result<()> {
+        let _guard = self.db_impl.locked_data.write().await;
+        // eprintln!("I have the write lock");
+
+        let _permits = tokio::time::timeout(
+            timeout,
+            self.db_impl
+                .reader_semaphore
+                .acquire_many(self.db_impl.options.max_readers as u32),
+        )
+        .await??;
+
+        // eprintln!("I have the permits");
+
+        Ok(())
+    }
+
     pub async fn keys(&self) -> Vec<K> {
         self.db_impl.keys().await
     }
@@ -116,6 +149,11 @@ enum InsertOrDelete<V> {
 struct DbImpl<K, V> {
     dir: PathBuf,
     options: Options,
+    /// if there are >0 permits outstanding, we cannot merge.
+    /// the merge process takes all N permits,
+    /// which has the effect of blocking all reads,
+    /// since reading during merging is not safe
+    reader_semaphore: tokio::sync::Semaphore,
     locked_data: RwLock<WriterData<K>>,
     bincode_config: bincode::config::Configuration<
         bincode::config::BigEndian,
@@ -199,6 +237,8 @@ where
                     Error::BincodeDecode(_decode_error) => continue,
                     Error::CorruptEntryData { .. } => continue,
                     Error::Time(_system_time_error) => (),
+                    Error::ReadPermit(_e) => (),
+                    Error::Timeout(_e) => (),
                 },
             }
         }
@@ -213,9 +253,17 @@ where
             .open(current_file_path)
             .await?;
 
+        let max_readers = options.max_readers;
+        assert!(max_readers > 0);
+
         Ok(Self {
             dir,
             options,
+            reader_semaphore: tokio::sync::Semaphore::new(
+                max_readers
+                    .try_into()
+                    .expect("max_readers must be able to fit into a u32 and a usize"),
+            ),
             locked_data: RwLock::new(WriterData {
                 keydir,
                 current_write_file,
@@ -404,6 +452,9 @@ where
         K: Borrow<Q>,
         Q: std::hash::Hash + Eq,
     {
+        // TODO should probably have a timeout here
+        let _permit = self.reader_semaphore.acquire().await?;
+
         // super duper fast, since all we are doing is
         // cloning an im::HashMap, which is basically a
         // pointer clone and refcount increment
@@ -746,5 +797,31 @@ mod tests {
         keys2.sort();
 
         assert_eq!(keys2, vec!["hello", "hi"]);
+    }
+
+    #[tokio::test]
+    async fn merge_read_drain_test() {
+        let dir = temp_dir::TempDir::with_prefix("b3").unwrap();
+
+        let db: Db<String, String> = Db::new(dir.path().to_owned(), Options::default())
+            .await
+            .unwrap();
+
+        for _i in 0..100000 {
+            let db = db.clone();
+
+            tokio::spawn(async move {
+                let _out = db.get("foo").await.unwrap();
+                // println!("{i}: {out:?}")
+            });
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        let result = db.merge(std::time::Duration::from_secs(1)).await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+
+        assert!(result.is_ok());
     }
 }
