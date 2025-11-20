@@ -31,8 +31,16 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+#[derive(Default, PartialEq)]
+pub enum SyncStrategy {
+    None,
+    #[default]
+    FullSync,
+}
+
+#[derive(Default)]
 pub struct Options {
-    dir: PathBuf,
+    sync_strategy: SyncStrategy,
 }
 
 #[derive(Clone)]
@@ -45,8 +53,8 @@ where
     K: Serialize + DeserializeOwned + Eq + std::hash::Hash,
     V: Serialize + DeserializeOwned,
 {
-    pub async fn new(options: Options) -> Result<Self> {
-        let db_impl = DbImpl::new(options).await?;
+    pub async fn new(dir: PathBuf, options: Options) -> Result<Self> {
+        let db_impl = DbImpl::new(dir, options).await?;
 
         Ok(Self {
             db_impl: Arc::new(RwLock::new(db_impl)),
@@ -104,8 +112,9 @@ enum InsertOrDelete<V> {
 }
 
 struct DbImpl<K, V> {
-    keydir: HashMap<K, Mapping>,
     dir: PathBuf,
+    options: Options,
+    keydir: HashMap<K, Mapping>,
     current_write_file: tokio::fs::File,
     current_file_id: u32,
     current_position: u32,
@@ -122,14 +131,14 @@ where
     K: Serialize + DeserializeOwned + Eq + std::hash::Hash,
     V: Serialize + DeserializeOwned,
 {
-    async fn new(options: Options) -> Result<Self> {
-        let mut b3_data_file_glob = options.dir.to_string_lossy();
+    async fn new(dir: PathBuf, options: Options) -> Result<Self> {
+        let mut b3_data_file_glob = dir.to_string_lossy();
         let b3_data_file_glob = b3_data_file_glob.to_mut();
         b3_data_file_glob.push_str("*.b3data");
 
         let mut data_files = vec![];
 
-        let mut entries = tokio::fs::read_dir(&options.dir).await?;
+        let mut entries = tokio::fs::read_dir(&dir).await?;
 
         // Iterate over the entries using a while let loop
         while let Some(entry) = entries.next_entry().await? {
@@ -181,7 +190,7 @@ where
             }
         }
 
-        let mut current_file_path = options.dir.clone();
+        let mut current_file_path = dir.clone();
         current_file_path.push(current_file_id.to_string());
         current_file_path.add_extension(B3_DATA_FILE_EXTENSION);
 
@@ -193,7 +202,8 @@ where
             .await?;
 
         Ok(Self {
-            dir: options.dir,
+            dir,
+            options,
             keydir,
             current_write_file,
             current_file_id,
@@ -334,9 +344,9 @@ where
 
         self.current_write_file.write_u32(crc).await?;
         self.current_write_file.write_all(&out_buf).await?;
-        // TODO make configurable,
-        // for turbo speed at the expense of durability
-        self.current_write_file.sync_all().await?;
+        if self.options.sync_strategy == SyncStrategy::FullSync {
+            self.current_write_file.sync_all().await?;
+        }
 
         let entry_size = (std::mem::size_of::<u32>() + out_buf.len())
             .try_into()
@@ -465,9 +475,10 @@ where
 
             self.current_write_file.write_u32(crc).await?;
             self.current_write_file.write_all(&out_buf).await?;
-            // TODO make configurable,
-            // for turbo speed at the expense of durability
-            self.current_write_file.sync_all().await?;
+
+            if self.options.sync_strategy == SyncStrategy::FullSync {
+                self.current_write_file.sync_all().await?;
+            }
 
             let entry_size: u32 = (std::mem::size_of::<u32>() + out_buf.len())
                 .try_into()
@@ -491,11 +502,9 @@ mod tests {
     #[tokio::test]
     async fn insert_and_get() {
         let dir = temp_dir::TempDir::with_prefix("b3").unwrap();
-        let db: Db<String, String> = Db::new(Options {
-            dir: dir.path().to_owned(),
-        })
-        .await
-        .unwrap();
+        let db: Db<String, String> = Db::new(dir.path().to_owned(), Options::default())
+            .await
+            .unwrap();
 
         db.insert("hello".to_string(), "there".to_string())
             .await
@@ -509,11 +518,9 @@ mod tests {
     #[tokio::test]
     async fn insert_and_get_and_delete_and_get() {
         let dir = temp_dir::TempDir::with_prefix("b3").unwrap();
-        let db: Db<String, String> = Db::new(Options {
-            dir: dir.path().to_owned(),
-        })
-        .await
-        .unwrap();
+        let db: Db<String, String> = Db::new(dir.path().to_owned(), Options::default())
+            .await
+            .unwrap();
 
         db.insert("hello".to_string(), "there".to_string())
             .await
@@ -533,11 +540,9 @@ mod tests {
     #[tokio::test]
     async fn get_with_no_prior_insert() {
         let dir = temp_dir::TempDir::with_prefix("b3").unwrap();
-        let db: Db<String, String> = Db::new(Options {
-            dir: dir.path().to_owned(),
-        })
-        .await
-        .unwrap();
+        let db: Db<String, String> = Db::new(dir.path().to_owned(), Options::default())
+            .await
+            .unwrap();
 
         let expected = db.get("nothing_here").await.unwrap();
 
@@ -547,11 +552,9 @@ mod tests {
     #[tokio::test]
     async fn delete_with_no_prior_insert() {
         let dir = temp_dir::TempDir::with_prefix("b3").unwrap();
-        let db: Db<String, String> = Db::new(Options {
-            dir: dir.path().to_owned(),
-        })
-        .await
-        .unwrap();
+        let db: Db<String, String> = Db::new(dir.path().to_owned(), Options::default())
+            .await
+            .unwrap();
 
         db.delete("not here").await.unwrap();
 
@@ -563,11 +566,9 @@ mod tests {
     #[tokio::test]
     async fn delete_followed_by_insert() {
         let dir = temp_dir::TempDir::with_prefix("b3").unwrap();
-        let db: Db<String, String> = Db::new(Options {
-            dir: dir.path().to_owned(),
-        })
-        .await
-        .unwrap();
+        let db: Db<String, String> = Db::new(dir.path().to_owned(), Options::default())
+            .await
+            .unwrap();
 
         db.delete("not here").await.unwrap();
 
@@ -587,11 +588,9 @@ mod tests {
         // create db1
         // insert 1 record
         {
-            let db: Db<String, String> = Db::new(Options {
-                dir: dir.path().to_owned(),
-            })
-            .await
-            .unwrap();
+            let db: Db<String, String> = Db::new(dir.path().to_owned(), Options::default())
+                .await
+                .unwrap();
 
             db.insert("hello".to_string(), "there".to_string())
                 .await
@@ -606,11 +605,9 @@ mod tests {
         // assert that previously inserted record is loaded from disk
         // delete that record
         {
-            let db: Db<String, String> = Db::new(Options {
-                dir: dir.path().to_owned(),
-            })
-            .await
-            .unwrap();
+            let db: Db<String, String> = Db::new(dir.path().to_owned(), Options::default())
+                .await
+                .unwrap();
 
             let expected = db.get("hello").await.unwrap().unwrap();
 
@@ -622,11 +619,9 @@ mod tests {
         // create db3
         // assert previously inserted and then deleted record does not exist
         {
-            let db: Db<String, String> = Db::new(Options {
-                dir: dir.path().to_owned(),
-            })
-            .await
-            .unwrap();
+            let db: Db<String, String> = Db::new(dir.path().to_owned(), Options::default())
+                .await
+                .unwrap();
 
             let expected = db.get("hello").await.unwrap();
 
