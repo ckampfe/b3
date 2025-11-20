@@ -486,13 +486,11 @@ where
         K: Borrow<Q>,
         Q: std::hash::Hash + Eq + Serialize,
     {
+        let mut guard = self.locked_data.write().await;
+
         // only actually insert a physical delete record
         // if we know about the key in the keydir
-        let keydir = { self.locked_data.read().await.keydir.clone() };
-
-        if keydir.contains_key(k) {
-            let mut guard = self.locked_data.write().await;
-
+        if guard.keydir.contains_key(k) {
             let writer_data = guard.deref_mut();
 
             writer_data.serialization_buf.clear();
