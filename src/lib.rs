@@ -1,10 +1,11 @@
 use bytes::{Buf, BytesMut};
 use crc32fast::Hasher;
+use im::HashMap;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::borrow::Borrow;
-use std::collections::HashMap;
 use std::marker::PhantomData;
+use std::ops::DerefMut;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -45,25 +46,24 @@ pub struct Options {
 
 #[derive(Clone)]
 pub struct Db<K, V> {
-    db_impl: Arc<RwLock<DbImpl<K, V>>>,
+    db_impl: Arc<DbImpl<K, V>>,
 }
 
 impl<K, V> Db<K, V>
 where
-    K: Serialize + DeserializeOwned + Eq + std::hash::Hash,
+    K: Clone + Serialize + DeserializeOwned + Eq + std::hash::Hash,
     V: Serialize + DeserializeOwned,
 {
     pub async fn new(dir: PathBuf, options: Options) -> Result<Self> {
         let db_impl = DbImpl::new(dir, options).await?;
 
         Ok(Self {
-            db_impl: Arc::new(RwLock::new(db_impl)),
+            db_impl: Arc::new(db_impl),
         })
     }
 
     pub async fn insert(&self, k: K, v: V) -> Result<()> {
-        let mut db_impl = self.db_impl.write().await;
-        db_impl.insert(k, &v).await
+        self.db_impl.insert(k, &v).await
     }
 
     pub async fn get<Q>(&self, k: &Q) -> Result<Option<V>>
@@ -72,8 +72,7 @@ where
         K: Borrow<Q>,
         Q: std::hash::Hash + Eq,
     {
-        let db_impl = self.db_impl.read().await;
-        db_impl.get(k).await
+        self.db_impl.get(k).await
     }
 
     pub async fn delete<Q>(&self, k: &Q) -> Result<()>
@@ -82,22 +81,15 @@ where
         K: Borrow<Q>,
         Q: std::hash::Hash + Eq + Serialize,
     {
-        let mut db_impl = self.db_impl.write().await;
-        db_impl.delete(k).await
+        self.db_impl.delete(k).await
     }
-}
 
-impl<K, V> Db<K, V>
-where
-    K: Clone,
-{
     pub async fn keys(&self) -> Vec<K> {
-        let db_impl = self.db_impl.read().await;
-        db_impl.keys()
+        self.db_impl.keys().await
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 struct Mapping {
     file_id: u32,
     entry_size: u32,
@@ -124,15 +116,20 @@ enum InsertOrDelete<V> {
 struct DbImpl<K, V> {
     dir: PathBuf,
     options: Options,
-    keydir: HashMap<K, Mapping>,
-    current_write_file: tokio::fs::File,
-    current_file_id: u32,
-    current_position: u32,
+    locked_data: RwLock<WriterData<K>>,
     bincode_config: bincode::config::Configuration<
         bincode::config::BigEndian,
         bincode::config::Fixint,
         bincode::config::NoLimit,
     >,
+    _v: PhantomData<V>,
+}
+
+struct WriterData<K> {
+    keydir: HashMap<K, Mapping>,
+    current_write_file: tokio::fs::File,
+    current_file_id: u32,
+    current_position: u32,
     /// the buffer into which we bincode the key and value.
     ///
     /// idea: a new type wrapper that has one method,
@@ -140,12 +137,11 @@ struct DbImpl<K, V> {
     /// and yields a mutable reference to the underlying buf.
     /// this way you must clear the buf in order to use it
     serialization_buf: Vec<u8>,
-    _v: PhantomData<V>,
 }
 
 impl<K, V> DbImpl<K, V>
 where
-    K: Serialize + DeserializeOwned + Eq + std::hash::Hash,
+    K: Clone + Serialize + DeserializeOwned + Eq + std::hash::Hash,
     V: Serialize + DeserializeOwned,
 {
     async fn new(dir: PathBuf, options: Options) -> Result<Self> {
@@ -214,19 +210,20 @@ where
         let current_write_file = tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            // .read(true)
             .open(current_file_path)
             .await?;
 
         Ok(Self {
             dir,
             options,
-            keydir,
-            current_write_file,
-            current_file_id,
-            current_position: 0,
+            locked_data: RwLock::new(WriterData {
+                keydir,
+                current_write_file,
+                current_file_id,
+                current_position: 0,
+                serialization_buf: vec![],
+            }),
             bincode_config,
-            serialization_buf: vec![],
             _v: PhantomData,
         })
     }
@@ -310,18 +307,23 @@ where
         }
     }
 
-    async fn insert(&mut self, k: K, v: &V) -> Result<()> {
-        self.serialization_buf.clear();
+    async fn insert(&self, k: K, v: &V) -> Result<()> {
+        let mut guard = self.locked_data.write().await;
+
+        // necessary to allow split borrow through rwlock
+        let writer_data = guard.deref_mut();
+
+        writer_data.serialization_buf.clear();
 
         let key_serialized_size = bincode::serde::encode_into_std_write(
             &k,
-            &mut self.serialization_buf,
+            &mut writer_data.serialization_buf,
             self.bincode_config,
         )?;
 
         let value_serialized_size = bincode::serde::encode_into_std_write(
             InsertOrDelete::Insert(v),
-            &mut self.serialization_buf,
+            &mut writer_data.serialization_buf,
             self.bincode_config,
         )?;
 
@@ -344,50 +346,54 @@ where
                     .expect("key size must be <= u32::MAX")
                     .to_be_bytes(),
             );
-            hasher.update(&self.serialization_buf);
+            hasher.update(&writer_data.serialization_buf);
 
             hasher.finalize()
         };
 
-        self.current_write_file.write_u32(crc).await?;
-        self.current_write_file
+        writer_data.current_write_file.write_u32(crc).await?;
+        writer_data
+            .current_write_file
             .write_u128(millis_since_epoch)
             .await?;
-        self.current_write_file
+        writer_data
+            .current_write_file
             .write_u32(u32::try_from(key_serialized_size).expect("key size must be <= u32::MAX"))
             .await?;
-        self.current_write_file
+        writer_data
+            .current_write_file
             .write_u32(
                 u32::try_from(value_serialized_size).expect("value size must be <= u32::MAX"),
             )
             .await?;
-        self.current_write_file
-            .write_all(&self.serialization_buf)
+        writer_data
+            .current_write_file
+            .write_all(&writer_data.serialization_buf)
             .await?;
 
         if self.options.sync_strategy == SyncStrategy::FullSync {
-            self.current_write_file.sync_all().await?;
+            writer_data.current_write_file.sync_all().await?;
         }
 
         let entry_size: u32 = (std::mem::size_of::<u32>()
             + std::mem::size_of::<u128>()
             + std::mem::size_of::<u32>()
             + std::mem::size_of::<u32>()
-            + self.serialization_buf.len())
+            + writer_data.serialization_buf.len())
         .try_into()
         .expect("entry size must be <= u32::MAX bytes");
 
-        self.keydir.insert(
+        writer_data.keydir.insert(
             k,
             Mapping {
-                file_id: self.current_file_id,
+                file_id: writer_data.current_file_id,
                 entry_size,
-                entry_position: self.current_position,
+                entry_position: writer_data.current_position,
                 _timestamp: millis_since_epoch,
             },
         );
 
-        self.current_position += entry_size;
+        guard.current_position += entry_size;
 
         Ok(())
     }
@@ -398,7 +404,41 @@ where
         K: Borrow<Q>,
         Q: std::hash::Hash + Eq,
     {
-        if let Some(mapping) = self.keydir.get(k) {
+        // super duper fast, since all we are doing is
+        // cloning an im::HashMap, which is basically a
+        // pointer clone and refcount increment
+        let keydir = {
+            let lock = self.locked_data.read().await;
+            lock.keydir.clone()
+        };
+
+        // TODO figure out how to solve reading of stale data during merges
+        //
+        // from this point on, once the keydir has been cloned,
+        // it is *entirely* uncoordinated from any
+        // other database operations at this point.
+        // this is because inserts and deletes are append-only.
+        // this means that, at worst, this function can read stale, valid data.
+        //
+        // merges are different, though, since merging
+        // involves rewriting the database files.
+        //
+        // the following sequence of operations can cause trouble.
+        //
+        // - this operation clones the keydir but has not yet read bytes from disk
+        // - a merge operation is initiated
+        // - this operation then then goes to read bytes from disk
+        //
+        // this could result in:
+        // - an IO error: file no longer exists, etc.
+        // - a deserialization error: failure to deserialize to a well-formed instance of V
+        // - the most concerning, a non-error: a deserialization to a well-formed
+        //   but *incorrect* instance of V
+        //
+        // for this reason it's probably best to perform a merge:
+        // - at startup, before any readers are allowed to read
+        // - at shutdown, once all readers have drained.
+        if let Some(mapping) = keydir.get(k) {
             let read_file_path = mapping.file_path(&self.dir);
 
             let mut read_file = tokio::fs::File::open(&read_file_path).await?;
@@ -440,7 +480,7 @@ where
         }
     }
 
-    async fn delete<Q>(&mut self, k: &Q) -> Result<()>
+    async fn delete<Q>(&self, k: &Q) -> Result<()>
     where
         Q: ?Sized,
         K: Borrow<Q>,
@@ -448,18 +488,24 @@ where
     {
         // only actually insert a physical delete record
         // if we know about the key in the keydir
-        if self.keydir.contains_key(k) {
-            self.serialization_buf.clear();
+        let keydir = { self.locked_data.read().await.keydir.clone() };
+
+        if keydir.contains_key(k) {
+            let mut guard = self.locked_data.write().await;
+
+            let writer_data = guard.deref_mut();
+
+            writer_data.serialization_buf.clear();
 
             let key_serialized_size = bincode::serde::encode_into_std_write(
                 k,
-                &mut self.serialization_buf,
+                &mut writer_data.serialization_buf,
                 self.bincode_config,
             )?;
 
             let value_serialized_size = bincode::serde::encode_into_std_write(
                 InsertOrDelete::Tombstone::<V>,
-                &mut self.serialization_buf,
+                &mut writer_data.serialization_buf,
                 self.bincode_config,
             )?;
 
@@ -482,44 +528,48 @@ where
                         .expect("key size must be <= u32::MAX")
                         .to_be_bytes(),
                 );
-                hasher.update(&self.serialization_buf);
+                hasher.update(&writer_data.serialization_buf);
 
                 hasher.finalize()
             };
 
-            self.current_write_file.write_u32(crc).await?;
-            self.current_write_file
+            writer_data.current_write_file.write_u32(crc).await?;
+            writer_data
+                .current_write_file
                 .write_u128(millis_since_epoch)
                 .await?;
-            self.current_write_file
+            writer_data
+                .current_write_file
                 .write_u32(
                     u32::try_from(key_serialized_size).expect("key size must be <= u32::MAX"),
                 )
                 .await?;
-            self.current_write_file
+            writer_data
+                .current_write_file
                 .write_u32(
                     u32::try_from(value_serialized_size).expect("value size must be <= u32::MAX"),
                 )
                 .await?;
-            self.current_write_file
-                .write_all(&self.serialization_buf)
+            writer_data
+                .current_write_file
+                .write_all(&writer_data.serialization_buf)
                 .await?;
 
             if self.options.sync_strategy == SyncStrategy::FullSync {
-                self.current_write_file.sync_all().await?;
+                writer_data.current_write_file.sync_all().await?;
             }
 
             let entry_size: u32 = (std::mem::size_of::<u32>()
                 + std::mem::size_of::<u128>()
                 + std::mem::size_of::<u32>()
                 + std::mem::size_of::<u32>()
-                + self.serialization_buf.len())
+                + writer_data.serialization_buf.len())
             .try_into()
             .expect("entry size must be <= u32::MAX bytes");
 
-            self.keydir.remove(k);
+            writer_data.keydir.remove(k);
 
-            self.current_position += entry_size;
+            writer_data.current_position += entry_size;
 
             Ok(())
         } else {
@@ -532,8 +582,13 @@ impl<K, V> DbImpl<K, V>
 where
     K: Clone,
 {
-    fn keys(&self) -> Vec<K> {
-        self.keydir.keys().cloned().collect()
+    async fn keys(&self) -> Vec<K> {
+        let keydir = {
+            let locked = self.locked_data.read().await;
+            locked.keydir.clone()
+        };
+
+        keydir.keys().cloned().collect()
     }
 }
 

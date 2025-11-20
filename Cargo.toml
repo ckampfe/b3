@@ -7,6 +7,7 @@ edition = "2024"
 bincode = { version = "2", features = ["serde"] }
 bytes = "1"
 crc32fast = "1"
+im = "15"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 tokio = { version = "1", features = ["fs", "io-util", "sync"] }
