@@ -15,11 +15,10 @@ Bitcask is a database/storage layer, depending on how you look at it.
 - insert
 - get
 - delete
+- keys
 
 ### not (yet) implemented
 
 - merge
-- keys
 - fold
 - force sync
-

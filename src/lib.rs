@@ -87,6 +87,16 @@ where
     }
 }
 
+impl<K, V> Db<K, V>
+where
+    K: Clone,
+{
+    pub async fn keys(&self) -> Vec<K> {
+        let db_impl = self.db_impl.read().await;
+        db_impl.keys()
+    }
+}
+
 #[derive(Debug)]
 struct Mapping {
     file_id: u32,
@@ -518,6 +528,15 @@ where
     }
 }
 
+impl<K, V> DbImpl<K, V>
+where
+    K: Clone,
+{
+    fn keys(&self) -> Vec<K> {
+        self.keydir.keys().cloned().collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -650,5 +669,34 @@ mod tests {
 
             assert!(expected.is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn keys() {
+        let dir = temp_dir::TempDir::with_prefix("b3").unwrap();
+
+        let db: Db<String, String> = Db::new(dir.path().to_owned(), Options::default())
+            .await
+            .unwrap();
+
+        let keys1 = db.keys().await;
+
+        assert_eq!(keys1, Vec::<String>::new());
+
+        db.insert("hello".to_string(), "there".to_string())
+            .await
+            .unwrap();
+
+        let keys2 = db.keys().await;
+
+        assert_eq!(keys2, vec!["hello"]);
+
+        db.insert("hi".to_string(), "ok".to_string()).await.unwrap();
+
+        let mut keys2 = db.keys().await;
+
+        keys2.sort();
+
+        assert_eq!(keys2, vec!["hello", "hi"]);
     }
 }
