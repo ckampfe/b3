@@ -1,8 +1,7 @@
 # b3
 
-oops I did it again...yet another bitcask implementation
+oops I did it again...yet another bitcask implementation!
 
-===
 
 Bitcask is a database/storage layer, depending on how you look at it.
 
