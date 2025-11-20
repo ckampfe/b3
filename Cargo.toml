@@ -9,7 +9,8 @@ bytes = "1"
 crc32fast = "1"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["fs", "io-util", "sync"] }
 
 [dev-dependencies]
 temp-dir = "0.1.16"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "rt", "sync"] }
