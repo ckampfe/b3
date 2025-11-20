@@ -280,8 +280,6 @@ where
 
             current_position += u32::try_from(header_length).unwrap() + key_size + value_size;
         }
-
-        // Ok(())
     }
 
     async fn insert(&mut self, k: K, v: &V) -> Result<()> {
