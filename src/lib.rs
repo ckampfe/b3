@@ -574,12 +574,7 @@ where
             Ok(())
         }
     }
-}
 
-impl<K, V> DbImpl<K, V>
-where
-    K: Clone,
-{
     async fn keys(&self) -> Vec<K> {
         let keydir = {
             let locked = self.locked_data.read().await;
