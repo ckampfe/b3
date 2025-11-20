@@ -108,7 +108,7 @@ where
             timeout,
             self.db_impl
                 .reader_semaphore
-                .acquire_many(self.db_impl.options.max_readers as u32),
+                .acquire_many(self.db_impl.options.max_readers),
         )
         .await??;
 
