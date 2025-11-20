@@ -20,7 +20,7 @@ pub enum Error {
     BincodeEncode(#[from] bincode::error::EncodeError),
     #[error("could not decode from bincode to type")]
     BincodeDecode(#[from] bincode::error::DecodeError),
-    #[error("time")]
+    #[error("error getting system time")]
     Time(#[from] std::time::SystemTimeError),
     #[error("corrupt data for entry, failed CRC32 check")]
     CorruptEntryData {
@@ -123,6 +123,13 @@ struct DbImpl<K, V> {
         bincode::config::Fixint,
         bincode::config::NoLimit,
     >,
+    /// the buffer into which we bincode the key and value.
+    ///
+    /// idea: a new type wrapper that has one method,
+    /// that when called clears the buf,
+    /// and yields a mutable reference to the underlying buf.
+    /// this way you must clear the buf in order to use it
+    serialization_buf: Vec<u8>,
     _v: PhantomData<V>,
 }
 
@@ -209,6 +216,7 @@ where
             current_file_id,
             current_position: 0,
             bincode_config,
+            serialization_buf: vec![],
             _v: PhantomData,
         })
     }
@@ -293,17 +301,17 @@ where
     }
 
     async fn insert(&mut self, k: K, v: &V) -> Result<()> {
-        // TODO probably some way to avoid this allocation for every single write
-        let mut kv_buf = vec![];
-        let mut out_buf = vec![];
+        self.serialization_buf.clear();
 
-        // write to disk
-        let key_serialized_size =
-            bincode::serde::encode_into_std_write(&k, &mut kv_buf, self.bincode_config)?;
+        let key_serialized_size = bincode::serde::encode_into_std_write(
+            &k,
+            &mut self.serialization_buf,
+            self.bincode_config,
+        )?;
 
         let value_serialized_size = bincode::serde::encode_into_std_write(
             InsertOrDelete::Insert(v),
-            &mut kv_buf,
+            &mut self.serialization_buf,
             self.bincode_config,
         )?;
 
@@ -312,45 +320,52 @@ where
             now.duration_since(std::time::UNIX_EPOCH)?.as_millis()
         };
 
-        out_buf.reserve_exact(
-            std::mem::size_of::<u128>()
-                + std::mem::size_of::<u32>()
-                + std::mem::size_of::<u32>()
-                + key_serialized_size
-                + value_serialized_size,
-        );
+        let crc = {
+            let mut hasher = crc32fast::Hasher::new();
 
-        out_buf.write_u128(millis_since_epoch).await?;
+            hasher.update(&millis_since_epoch.to_be_bytes());
+            hasher.update(
+                &u32::try_from(key_serialized_size)
+                    .expect("key size must be <= u32::MAX")
+                    .to_be_bytes(),
+            );
+            hasher.update(
+                &u32::try_from(value_serialized_size)
+                    .expect("key size must be <= u32::MAX")
+                    .to_be_bytes(),
+            );
+            hasher.update(&self.serialization_buf);
 
-        out_buf
-            .write_u32(
-                key_serialized_size
-                    .try_into()
-                    .expect("key size must be <= u32::MAX"),
-            )
-            .await?;
-
-        out_buf
-            .write_u32(
-                value_serialized_size
-                    .try_into()
-                    .expect("value size must be <= u32::MAX"),
-            )
-            .await?;
-
-        out_buf.extend_from_slice(&kv_buf);
-
-        let crc = crc32fast::hash(&out_buf);
+            hasher.finalize()
+        };
 
         self.current_write_file.write_u32(crc).await?;
-        self.current_write_file.write_all(&out_buf).await?;
+        self.current_write_file
+            .write_u128(millis_since_epoch)
+            .await?;
+        self.current_write_file
+            .write_u32(u32::try_from(key_serialized_size).expect("key size must be <= u32::MAX"))
+            .await?;
+        self.current_write_file
+            .write_u32(
+                u32::try_from(value_serialized_size).expect("value size must be <= u32::MAX"),
+            )
+            .await?;
+        self.current_write_file
+            .write_all(&self.serialization_buf)
+            .await?;
+
         if self.options.sync_strategy == SyncStrategy::FullSync {
             self.current_write_file.sync_all().await?;
         }
 
-        let entry_size = (std::mem::size_of::<u32>() + out_buf.len())
-            .try_into()
-            .expect("data files must have <= u32::MAX bytes");
+        let entry_size: u32 = (std::mem::size_of::<u32>()
+            + std::mem::size_of::<u128>()
+            + std::mem::size_of::<u32>()
+            + std::mem::size_of::<u32>()
+            + self.serialization_buf.len())
+        .try_into()
+        .expect("entry size must be <= u32::MAX bytes");
 
         self.keydir.insert(
             k,
@@ -424,17 +439,17 @@ where
         // only actually insert a physical delete record
         // if we know about the key in the keydir
         if self.keydir.contains_key(k) {
-            // TODO probably some way to avoid this allocation for every single write
-            let mut kv_buf = vec![];
-            let mut out_buf = vec![];
+            self.serialization_buf.clear();
 
-            // write to disk
-            let key_serialized_size =
-                bincode::serde::encode_into_std_write(k, &mut kv_buf, self.bincode_config)?;
+            let key_serialized_size = bincode::serde::encode_into_std_write(
+                k,
+                &mut self.serialization_buf,
+                self.bincode_config,
+            )?;
 
             let value_serialized_size = bincode::serde::encode_into_std_write(
                 InsertOrDelete::Tombstone::<V>,
-                &mut kv_buf,
+                &mut self.serialization_buf,
                 self.bincode_config,
             )?;
 
@@ -443,46 +458,54 @@ where
                 now.duration_since(std::time::UNIX_EPOCH)?.as_millis()
             };
 
-            out_buf.reserve_exact(
-                std::mem::size_of::<u128>()
-                    + std::mem::size_of::<u32>()
-                    + std::mem::size_of::<u32>()
-                    + key_serialized_size
-                    + value_serialized_size,
-            );
+            let crc = {
+                let mut hasher = crc32fast::Hasher::new();
 
-            out_buf.write_u128(millis_since_epoch).await?;
+                hasher.update(&millis_since_epoch.to_be_bytes());
+                hasher.update(
+                    &u32::try_from(key_serialized_size)
+                        .expect("key size must be <= u32::MAX")
+                        .to_be_bytes(),
+                );
+                hasher.update(
+                    &u32::try_from(value_serialized_size)
+                        .expect("key size must be <= u32::MAX")
+                        .to_be_bytes(),
+                );
+                hasher.update(&self.serialization_buf);
 
-            out_buf
-                .write_u32(
-                    key_serialized_size
-                        .try_into()
-                        .expect("key size must be <= u32::MAX"),
-                )
-                .await?;
-
-            out_buf
-                .write_u32(
-                    value_serialized_size
-                        .try_into()
-                        .expect("value size must be <= u32::MAX"),
-                )
-                .await?;
-
-            out_buf.extend_from_slice(&kv_buf);
-
-            let crc = crc32fast::hash(&out_buf);
+                hasher.finalize()
+            };
 
             self.current_write_file.write_u32(crc).await?;
-            self.current_write_file.write_all(&out_buf).await?;
+            self.current_write_file
+                .write_u128(millis_since_epoch)
+                .await?;
+            self.current_write_file
+                .write_u32(
+                    u32::try_from(key_serialized_size).expect("key size must be <= u32::MAX"),
+                )
+                .await?;
+            self.current_write_file
+                .write_u32(
+                    u32::try_from(value_serialized_size).expect("value size must be <= u32::MAX"),
+                )
+                .await?;
+            self.current_write_file
+                .write_all(&self.serialization_buf)
+                .await?;
 
             if self.options.sync_strategy == SyncStrategy::FullSync {
                 self.current_write_file.sync_all().await?;
             }
 
-            let entry_size: u32 = (std::mem::size_of::<u32>() + out_buf.len())
-                .try_into()
-                .expect("data files must have <= u32::MAX bytes");
+            let entry_size: u32 = (std::mem::size_of::<u32>()
+                + std::mem::size_of::<u128>()
+                + std::mem::size_of::<u32>()
+                + std::mem::size_of::<u32>()
+                + self.serialization_buf.len())
+            .try_into()
+            .expect("entry size must be <= u32::MAX bytes");
 
             self.keydir.remove(k);
 
