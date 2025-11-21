@@ -452,11 +452,6 @@ where
         K: Borrow<Q>,
         Q: std::hash::Hash + Eq,
     {
-        // TODO what should the order be w/r/t to the reader_semaphore and keydir lock acquisition?
-
-        // TODO should probably have a timeout here
-        let _permit = self.reader_semaphore.acquire().await?;
-
         // super duper fast, since all we are doing is
         // cloning an im::HashMap, which is basically a
         // pointer clone and refcount increment
@@ -464,6 +459,9 @@ where
             let lock = self.locked_data.read().await;
             lock.keydir.clone()
         };
+
+        // TODO should probably have a timeout here
+        let _permit = self.reader_semaphore.acquire().await?;
 
         // TODO figure out how to solve reading of stale data during merges
         //
