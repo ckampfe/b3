@@ -8,7 +8,7 @@ use std::marker::PhantomData;
 use std::ops::DerefMut;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::RwLock;
 
 const B3_DATA_FILE_EXTENSION: &str = "b3data";
@@ -206,6 +206,7 @@ where
         let current_file_id = data_files
             .iter()
             .map(|path| {
+                // TODO fix unwraps
                 path.file_stem()
                     .unwrap()
                     .to_str()
@@ -491,6 +492,10 @@ where
             let mut buf = BytesMut::new();
             buf.resize(usize::try_from(mapping.entry_size).unwrap(), 0);
 
+            read_file
+                .seek(std::io::SeekFrom::Start(mapping.entry_position.into()))
+                .await?;
+
             read_file.read_exact(&mut buf).await?;
 
             let crc = buf.get_u32();
@@ -642,6 +647,7 @@ mod tests {
     #[tokio::test]
     async fn insert_and_get() {
         let dir = temp_dir::TempDir::with_prefix("b3").unwrap();
+
         let db: Db<String, String> = Db::new(dir.path().to_owned(), Options::default())
             .await
             .unwrap();
@@ -653,6 +659,49 @@ mod tests {
         let expected = db.get("hello").await.unwrap();
 
         assert_eq!(expected, Some("there".to_string()));
+    }
+
+    #[tokio::test]
+    async fn multiple_insert_and_get_and_delete() {
+        let dir = temp_dir::TempDir::with_prefix("b3").unwrap();
+
+        let db: Db<String, String> = Db::new(dir.path().to_owned(), Options::default())
+            .await
+            .unwrap();
+
+        db.insert("a".to_string(), "1".to_string()).await.unwrap();
+        db.insert("b".to_string(), "2".to_string()).await.unwrap();
+        db.insert("c".to_string(), "3".to_string()).await.unwrap();
+
+        let a1 = db.get("a").await.unwrap().unwrap();
+        let b1 = db.get("b").await.unwrap().unwrap();
+        let c1 = db.get("c").await.unwrap().unwrap();
+
+        assert_eq!(a1, "1".to_string());
+        assert_eq!(b1, "2".to_string());
+        assert_eq!(c1, "3".to_string());
+
+        db.insert("a".to_string(), "x".to_string()).await.unwrap();
+        db.insert("b".to_string(), "y".to_string()).await.unwrap();
+        db.insert("c".to_string(), "z".to_string()).await.unwrap();
+
+        let a2 = db.get("a").await.unwrap().unwrap();
+        let b2 = db.get("b").await.unwrap().unwrap();
+        let c2 = db.get("c").await.unwrap().unwrap();
+
+        assert_eq!(a2, "x".to_string());
+        assert_eq!(b2, "y".to_string());
+        assert_eq!(c2, "z".to_string());
+
+        db.delete("b").await.unwrap();
+
+        let a3 = db.get("a").await.unwrap().unwrap();
+        let b3 = db.get("b").await.unwrap();
+        let c3 = db.get("c").await.unwrap().unwrap();
+
+        assert_eq!(a3, "x".to_string());
+        assert_eq!(b3, None);
+        assert_eq!(c3, "z".to_string());
     }
 
     #[tokio::test]
