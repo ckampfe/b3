@@ -2,6 +2,7 @@
 
 oops I did it again...yet another bitcask implementation!
 
+[![Rust](https://github.com/ckampfe/b3/actions/workflows/rust.yml/badge.svg)](https://github.com/ckampfe/b3/actions/workflows/rust.yml)
 
 Bitcask is a database/storage layer, depending on how you look at it.
 
