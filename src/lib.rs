@@ -452,6 +452,8 @@ where
         K: Borrow<Q>,
         Q: std::hash::Hash + Eq,
     {
+        // TODO what should the order be w/r/t to the reader_semaphore and keydir lock acquisition?
+
         // TODO should probably have a timeout here
         let _permit = self.reader_semaphore.acquire().await?;
 
