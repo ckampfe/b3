@@ -101,7 +101,7 @@ where
 
     /// no writers or readers are allowed
     pub async fn merge(&self, timeout: std::time::Duration) -> Result<()> {
-        let _guard = self.db_impl.locked_data.write().await;
+        let _writer_data_guard = self.db_impl.writer_data.write().await;
         // eprintln!("I have the write lock");
 
         let _permits = tokio::time::timeout(
@@ -154,7 +154,7 @@ struct DbImpl<K, V> {
     /// which has the effect of blocking all reads,
     /// since reading during merging is not safe
     reader_semaphore: tokio::sync::Semaphore,
-    locked_data: RwLock<WriterData<K>>,
+    writer_data: RwLock<WriterData<K>>,
     bincode_config: bincode::config::Configuration<
         bincode::config::BigEndian,
         bincode::config::Fixint,
@@ -264,7 +264,7 @@ where
                     .try_into()
                     .expect("max_readers must be able to fit into a u32 and a usize"),
             ),
-            locked_data: RwLock::new(WriterData {
+            writer_data: RwLock::new(WriterData {
                 keydir,
                 current_write_file,
                 current_file_id,
@@ -356,7 +356,7 @@ where
     }
 
     async fn insert(&self, k: K, v: &V) -> Result<()> {
-        let mut guard = self.locked_data.write().await;
+        let mut guard = self.writer_data.write().await;
 
         // necessary to allow split borrow through rwlock
         let writer_data = guard.deref_mut();
@@ -452,13 +452,7 @@ where
         K: Borrow<Q>,
         Q: std::hash::Hash + Eq,
     {
-        // super duper fast, since all we are doing is
-        // cloning an im::HashMap, which is basically a
-        // pointer clone and refcount increment
-        let keydir = {
-            let lock = self.locked_data.read().await;
-            lock.keydir.clone()
-        };
+        let keydir = self.keydir_clone().await;
 
         // TODO should probably have a timeout here
         let _permit = self.reader_semaphore.acquire().await?;
@@ -537,12 +531,12 @@ where
         K: Borrow<Q>,
         Q: std::hash::Hash + Eq + Serialize,
     {
-        let mut guard = self.locked_data.write().await;
+        let mut writer_data = self.writer_data.write().await;
 
         // only actually insert a physical delete record
         // if we know about the key in the keydir
-        if guard.keydir.contains_key(k) {
-            let writer_data = guard.deref_mut();
+        if writer_data.keydir.contains_key(k) {
+            let writer_data = writer_data.deref_mut();
 
             writer_data.serialization_buf.clear();
 
@@ -627,12 +621,17 @@ where
     }
 
     async fn keys(&self) -> Vec<K> {
-        let keydir = {
-            let locked = self.locked_data.read().await;
-            locked.keydir.clone()
-        };
+        let keydir = self.keydir_clone().await;
 
         keydir.keys().cloned().collect()
+    }
+
+    /// super duper fast, since all we are doing is
+    /// cloning an im::HashMap, which is basically a
+    /// pointer clone and refcount increment
+    async fn keydir_clone(&self) -> HashMap<K, Mapping> {
+        let writer_data = self.writer_data.read().await;
+        writer_data.keydir.clone()
     }
 }
 
