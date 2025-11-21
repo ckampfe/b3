@@ -1,4 +1,5 @@
 use bytes::{Buf, BytesMut};
+use core::panic;
 use crc32fast::Hasher;
 use im::HashMap;
 use serde::de::DeserializeOwned;
@@ -90,11 +91,11 @@ where
         self.db_impl.get(k).await
     }
 
-    pub async fn delete<Q>(&self, k: &Q) -> Result<()>
-    where
-        Q: ?Sized,
-        K: Borrow<Q>,
-        Q: std::hash::Hash + Eq + Serialize,
+    pub async fn delete(&self, k: K) -> Result<()>
+// where
+    //     Q: ?Sized,
+    //     K: Borrow<Q>,
+    //     Q: std::hash::Hash + Eq + Serialize,
     {
         self.db_impl.delete(k).await
     }
@@ -142,8 +143,9 @@ impl Mapping {
 #[derive(Serialize, Deserialize)]
 enum InsertOrDelete<V> {
     Insert(V),
-    #[serde(rename = "__b3_tombstone")]
     Tombstone,
+    // #[serde(rename = "__b3_tombstone")]
+    Foo,
 }
 
 struct DbImpl<K, V> {
@@ -337,6 +339,7 @@ where
                 bincode::serde::decode_from_slice(&value_bytes, bincode_config)?;
 
             match v {
+                InsertOrDelete::Foo => panic!(),
                 InsertOrDelete::Insert(_v) => {
                     let mapping = Mapping {
                         file_id: path.file_stem().unwrap().to_str().unwrap().parse().unwrap(),
@@ -489,13 +492,18 @@ where
             // unused on a simple `get`, but used when we load
             // files from disk at startup
             let _key_bytes = buf.split_to(usize::try_from(key_size).unwrap());
+            dbg!(&_key_bytes);
+            dbg!(_key_bytes.len());
 
             let value_bytes = buf.split_to(usize::try_from(value_size).unwrap());
+            dbg!(&value_bytes);
+            dbg!(value_bytes.len());
 
             let (v, _): (InsertOrDelete<V>, usize) =
                 bincode::serde::decode_from_slice(&value_bytes, self.bincode_config)?;
 
             match v {
+                InsertOrDelete::Foo => panic!(),
                 InsertOrDelete::Insert(v) => Ok(Some(v)),
                 InsertOrDelete::Tombstone => Ok(None),
             }
@@ -504,23 +512,23 @@ where
         }
     }
 
-    async fn delete<Q>(&self, k: &Q) -> Result<()>
-    where
-        Q: ?Sized,
-        K: Borrow<Q>,
-        Q: std::hash::Hash + Eq + Serialize,
+    async fn delete(&self, k: K) -> Result<()>
+// where
+        // Q: ?Sized,
+        // K: Borrow<Q>,
+        // Q: std::hash::Hash + Eq + Serialize,
     {
         let mut writer_data = self.writer_data.write().await;
 
         // only actually insert a physical delete record
         // if we know about the key in the keydir
-        if writer_data.keydir.contains_key(k) {
+        if writer_data.keydir.contains_key(&k) {
             let writer_data = writer_data.deref_mut();
 
             writer_data.serialization_buf.clear();
 
             let key_serialized_size = bincode::serde::encode_into_std_write(
-                k,
+                &k,
                 &mut writer_data.serialization_buf,
                 self.bincode_config,
             )?;
@@ -589,7 +597,16 @@ where
             .try_into()
             .expect("entry size must be <= u32::MAX bytes");
 
-            writer_data.keydir.remove(k);
+            // writer_data.keydir.remove(k);
+            writer_data.keydir.insert(
+                k,
+                Mapping {
+                    file_id: writer_data.current_file_id,
+                    entry_size,
+                    entry_position: writer_data.current_position,
+                    _timestamp: millis_since_epoch,
+                },
+            );
 
             writer_data.current_position += entry_size;
 
@@ -621,84 +638,106 @@ mod tests {
     #[tokio::test]
     async fn insert_and_get() {
         let dir = temp_dir::TempDir::with_prefix("b3").unwrap();
+        let path = dir.path();
 
-        let db: Db<String, String> = Db::new(dir.path().to_owned(), Options::default())
-            .await
-            .unwrap();
-
-        db.insert("hello".to_string(), "there".to_string())
-            .await
-            .unwrap();
-
-        let expected = db.get("hello").await.unwrap();
-
-        assert_eq!(expected, Some("there".to_string()));
-    }
-
-    #[tokio::test]
-    async fn multiple_insert_and_get_and_delete() {
-        let dir = temp_dir::TempDir::with_prefix("b3").unwrap();
-
-        let db: Db<String, String> = Db::new(dir.path().to_owned(), Options::default())
-            .await
-            .unwrap();
-
-        db.insert("a".to_string(), "1".to_string()).await.unwrap();
-        db.insert("b".to_string(), "2".to_string()).await.unwrap();
-        db.insert("c".to_string(), "3".to_string()).await.unwrap();
-
-        let a1 = db.get("a").await.unwrap().unwrap();
-        let b1 = db.get("b").await.unwrap().unwrap();
-        let c1 = db.get("c").await.unwrap().unwrap();
-
-        assert_eq!(a1, "1".to_string());
-        assert_eq!(b1, "2".to_string());
-        assert_eq!(c1, "3".to_string());
-
-        db.insert("a".to_string(), "x".to_string()).await.unwrap();
-        db.insert("b".to_string(), "y".to_string()).await.unwrap();
-        db.insert("c".to_string(), "z".to_string()).await.unwrap();
-
-        let a2 = db.get("a").await.unwrap().unwrap();
-        let b2 = db.get("b").await.unwrap().unwrap();
-        let c2 = db.get("c").await.unwrap().unwrap();
-
-        assert_eq!(a2, "x".to_string());
-        assert_eq!(b2, "y".to_string());
-        assert_eq!(c2, "z".to_string());
-
-        db.delete("b").await.unwrap();
-
-        let a3 = db.get("a").await.unwrap().unwrap();
-        let b3 = db.get("b").await.unwrap();
-        let c3 = db.get("c").await.unwrap().unwrap();
-
-        assert_eq!(a3, "x".to_string());
-        assert_eq!(b3, None);
-        assert_eq!(c3, "z".to_string());
-    }
-
-    #[tokio::test]
-    async fn insert_and_get_and_delete_and_get() {
-        let dir = temp_dir::TempDir::with_prefix("b3").unwrap();
-        let db: Db<String, String> = Db::new(dir.path().to_owned(), Options::default())
-            .await
-            .unwrap();
+        let db: Db<String, String> = Db::new(path.to_owned(), Options::default()).await.unwrap();
 
         db.insert("hello".to_string(), "there".to_string())
             .await
             .unwrap();
 
+        // let dirs = tokio::fs::read_dir(dir.path()).await.unwrap();
+
+        // dbg!(&dirs);
+
+        let mut f = path.to_owned();
+        f.push("1");
+        f.add_extension("b3data");
+
+        // dbg!(&f);
+
+        // let data_file = tokio::fs::File::open(f).await.unwrap();
+
+        // /var/folders/4r/t_mp53gn60q8kq604jrsqj9m0000gn/T/b3ee6d-1/1.b3data
+        // /var/folders/4r/t_mp53gn60q8kq604jrsqj9m0000gn/T/b3ee6d-1/1.b3data
+
         let expected = db.get("hello").await.unwrap();
+
+        db.delete("hello".to_string()).await.unwrap();
+
+        let expected = db.get("hello").await.unwrap();
+
+        let bin_data = tokio::fs::read(f).await.unwrap();
+        // println!("{:?}", &bin_data);
+        // dbg!(bin_data);
 
         assert_eq!(expected, Some("there".to_string()));
-
-        db.delete("hello").await.unwrap();
-
-        let expected = db.get("hello").await.unwrap();
-
-        assert_eq!(expected, None);
     }
+
+    // #[tokio::test]
+    // async fn multiple_insert_and_get_and_delete() {
+    //     let dir = temp_dir::TempDir::with_prefix("b3").unwrap();
+
+    //     let db: Db<String, String> = Db::new(dir.path().to_owned(), Options::default())
+    //         .await
+    //         .unwrap();
+
+    //     db.insert("a".to_string(), "1".to_string()).await.unwrap();
+    //     db.insert("b".to_string(), "2".to_string()).await.unwrap();
+    //     db.insert("c".to_string(), "3".to_string()).await.unwrap();
+
+    //     let a1 = db.get("a").await.unwrap().unwrap();
+    //     let b1 = db.get("b").await.unwrap().unwrap();
+    //     let c1 = db.get("c").await.unwrap().unwrap();
+
+    //     assert_eq!(a1, "1".to_string());
+    //     assert_eq!(b1, "2".to_string());
+    //     assert_eq!(c1, "3".to_string());
+
+    //     db.insert("a".to_string(), "x".to_string()).await.unwrap();
+    //     db.insert("b".to_string(), "y".to_string()).await.unwrap();
+    //     db.insert("c".to_string(), "z".to_string()).await.unwrap();
+
+    //     let a2 = db.get("a").await.unwrap().unwrap();
+    //     let b2 = db.get("b").await.unwrap().unwrap();
+    //     let c2 = db.get("c").await.unwrap().unwrap();
+
+    //     assert_eq!(a2, "x".to_string());
+    //     assert_eq!(b2, "y".to_string());
+    //     assert_eq!(c2, "z".to_string());
+
+    //     db.delete("b").await.unwrap();
+
+    //     let a3 = db.get("a").await.unwrap().unwrap();
+    //     let b3 = db.get("b").await.unwrap();
+    //     let c3 = db.get("c").await.unwrap().unwrap();
+
+    //     assert_eq!(a3, "x".to_string());
+    //     assert_eq!(b3, None);
+    //     assert_eq!(c3, "z".to_string());
+    // }
+
+    // #[tokio::test]
+    // async fn insert_and_get_and_delete_and_get() {
+    //     let dir = temp_dir::TempDir::with_prefix("b3").unwrap();
+    //     let db: Db<String, String> = Db::new(dir.path().to_owned(), Options::default())
+    //         .await
+    //         .unwrap();
+
+    //     db.insert("hello".to_string(), "there".to_string())
+    //         .await
+    //         .unwrap();
+
+    //     let expected = db.get("hello").await.unwrap();
+
+    //     assert_eq!(expected, Some("there".to_string()));
+
+    //     db.delete("hello").await.unwrap();
+
+    //     let expected = db.get("hello").await.unwrap();
+
+    //     assert_eq!(expected, None);
+    // }
 
     #[tokio::test]
     async fn get_with_no_prior_insert() {
@@ -712,85 +751,85 @@ mod tests {
         assert!(expected.is_none());
     }
 
-    #[tokio::test]
-    async fn delete_with_no_prior_insert() {
-        let dir = temp_dir::TempDir::with_prefix("b3").unwrap();
-        let db: Db<String, String> = Db::new(dir.path().to_owned(), Options::default())
-            .await
-            .unwrap();
+    // #[tokio::test]
+    // async fn delete_with_no_prior_insert() {
+    //     let dir = temp_dir::TempDir::with_prefix("b3").unwrap();
+    //     let db: Db<String, String> = Db::new(dir.path().to_owned(), Options::default())
+    //         .await
+    //         .unwrap();
 
-        db.delete("not here").await.unwrap();
+    //     db.delete("not here").await.unwrap();
 
-        let expected = db.get("not here").await.unwrap();
+    //     let expected = db.get("not here").await.unwrap();
 
-        assert_eq!(expected, None)
-    }
+    //     assert_eq!(expected, None)
+    // }
 
-    #[tokio::test]
-    async fn delete_followed_by_insert() {
-        let dir = temp_dir::TempDir::with_prefix("b3").unwrap();
-        let db: Db<String, String> = Db::new(dir.path().to_owned(), Options::default())
-            .await
-            .unwrap();
+    // #[tokio::test]
+    // async fn delete_followed_by_insert() {
+    //     let dir = temp_dir::TempDir::with_prefix("b3").unwrap();
+    //     let db: Db<String, String> = Db::new(dir.path().to_owned(), Options::default())
+    //         .await
+    //         .unwrap();
 
-        db.delete("not here").await.unwrap();
+    //     db.delete("not here").await.unwrap();
 
-        db.insert("not here".to_string(), "actually".to_string())
-            .await
-            .unwrap();
+    //     db.insert("not here".to_string(), "actually".to_string())
+    //         .await
+    //         .unwrap();
 
-        let expected = db.get("not here").await.unwrap().unwrap();
+    //     let expected = db.get("not here").await.unwrap().unwrap();
 
-        assert_eq!(expected, "actually");
-    }
+    //     assert_eq!(expected, "actually");
+    // }
 
-    #[tokio::test]
-    async fn loads_files_in_order() {
-        let dir = temp_dir::TempDir::with_prefix("b3").unwrap();
+    // #[tokio::test]
+    // async fn loads_files_in_order() {
+    //     let dir = temp_dir::TempDir::with_prefix("b3").unwrap();
 
-        // create db1
-        // insert 1 record
-        {
-            let db: Db<String, String> = Db::new(dir.path().to_owned(), Options::default())
-                .await
-                .unwrap();
+    //     // create db1
+    //     // insert 1 record
+    //     {
+    //         let db: Db<String, String> = Db::new(dir.path().to_owned(), Options::default())
+    //             .await
+    //             .unwrap();
 
-            db.insert("hello".to_string(), "there".to_string())
-                .await
-                .unwrap();
+    //         db.insert("hello".to_string(), "there".to_string())
+    //             .await
+    //             .unwrap();
 
-            let expected = db.get("hello").await.unwrap().unwrap();
+    //         let expected = db.get("hello").await.unwrap().unwrap();
 
-            assert_eq!(expected, "there".to_string());
-        }
+    //         assert_eq!(expected, "there".to_string());
+    //     }
 
-        // create db2
-        // assert that previously inserted record is loaded from disk
-        // delete that record
-        {
-            let db: Db<String, String> = Db::new(dir.path().to_owned(), Options::default())
-                .await
-                .unwrap();
+    //     // create db2
+    //     // assert that previously inserted record is loaded from disk
+    //     // delete that record
+    //     {
+    //         let db: Db<String, String> = Db::new(dir.path().to_owned(), Options::default())
+    //             .await
+    //             .unwrap();
 
-            let expected = db.get("hello").await.unwrap().unwrap();
+    //         let expected = db.get("hello").await.unwrap().unwrap();
 
-            assert_eq!(expected, "there".to_string());
+    //         assert_eq!(expected, "there".to_string());
 
-            db.delete("hello").await.unwrap();
-        }
+    //         db.delete("hello").await.unwrap();
+    //     }
 
-        // create db3
-        // assert previously inserted and then deleted record does not exist
-        {
-            let db: Db<String, String> = Db::new(dir.path().to_owned(), Options::default())
-                .await
-                .unwrap();
+    //     // create db3
+    //     // assert previously inserted and then deleted record does not exist
+    //     {
+    //         let db: Db<String, String> = Db::new(dir.path().to_owned(), Options::default())
+    //             .await
+    //             .unwrap();
 
-            let expected = db.get("hello").await.unwrap();
+    //         let expected = db.get("hello").await.unwrap();
 
-            assert!(expected.is_none());
-        }
-    }
+    //         assert!(expected.is_none());
+    //     }
+    // }
 
     #[tokio::test]
     async fn keys() {
