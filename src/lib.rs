@@ -458,32 +458,6 @@ where
         // TODO should probably have a timeout here
         let _permit = self.reader_semaphore.acquire().await?;
 
-        // TODO figure out how to solve reading of stale data during merges
-        //
-        // from this point on, once the keydir has been cloned,
-        // it is *entirely* uncoordinated from any
-        // other database operations at this point.
-        // this is because inserts and deletes are append-only.
-        // this means that, at worst, this function can read stale, valid data.
-        //
-        // merges are different, though, since merging
-        // involves rewriting the database files.
-        //
-        // the following sequence of operations can cause trouble.
-        //
-        // - this operation clones the keydir but has not yet read bytes from disk
-        // - a merge operation is initiated
-        // - this operation then then goes to read bytes from disk
-        //
-        // this could result in:
-        // - an IO error: file no longer exists, etc.
-        // - a deserialization error: failure to deserialize to a well-formed instance of V
-        // - the most concerning, a non-error: a deserialization to a well-formed
-        //   but *incorrect* instance of V
-        //
-        // for this reason it's probably best to perform a merge:
-        // - at startup, before any readers are allowed to read
-        // - at shutdown, once all readers have drained.
         if let Some(mapping) = keydir.get(k) {
             let read_file_path = mapping.file_path(&self.dir);
 
