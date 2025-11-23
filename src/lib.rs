@@ -8,7 +8,8 @@ use std::marker::PhantomData;
 use std::ops::DerefMut;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::fs::File;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufWriter};
 use tokio::sync::RwLock;
 
 const B3_DATA_FILE_EXTENSION: &str = "b3data";
@@ -165,7 +166,7 @@ struct DbImpl<K, V> {
 
 struct WriterData<K> {
     keydir: HashMap<K, Mapping>,
-    current_write_file: tokio::fs::File,
+    current_write_file: BufWriter<File>,
     current_file_id: u32,
     current_position: u32,
     /// the buffer into which we bincode the key and value.
@@ -253,6 +254,8 @@ where
             .append(true)
             .open(current_file_path)
             .await?;
+
+        let current_write_file = BufWriter::new(current_write_file);
 
         let max_readers = options.max_readers;
         assert!(max_readers > 0);
@@ -420,8 +423,12 @@ where
             .write_all(&writer_data.serialization_buf)
             .await?;
 
+        // flush the BufWriter to the OS buffers
+        writer_data.current_write_file.flush().await?;
+
+        // and fsync the OS buffers to disk, if configured to do so
         if self.options.sync_strategy == SyncStrategy::FullSync {
-            writer_data.current_write_file.sync_all().await?;
+            writer_data.current_write_file.get_ref().sync_all().await?;
         }
 
         let entry_size: u32 = (std::mem::size_of::<u32>()
@@ -577,8 +584,12 @@ where
                 .write_all(&writer_data.serialization_buf)
                 .await?;
 
+            // flush the BufWriter to the OS buffers
+            writer_data.current_write_file.flush().await?;
+
+            // and fsync the OS buffers to disk, if configured to do so
             if self.options.sync_strategy == SyncStrategy::FullSync {
-                writer_data.current_write_file.sync_all().await?;
+                writer_data.current_write_file.get_ref().sync_all().await?;
             }
 
             let entry_size: u32 = (std::mem::size_of::<u32>()
